@@ -1,4 +1,5 @@
-
+#include "cjson/cJSON.h"
+#include "curl/curl.h"
 
 
 struct broker_settings {
@@ -11,3 +12,5 @@ struct broker_settings {
 
 
 void free_broker_settings_struct(struct broker_settings* data);
+
+void cleanup(CURL *curl, cJSON *json, char *payload, char *url);

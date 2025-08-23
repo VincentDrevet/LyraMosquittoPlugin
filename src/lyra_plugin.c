@@ -6,6 +6,9 @@
 #include "stdlib.h"
 #include "lyra_plugin.h"
 #include "cjson/cJSON.h"
+#include "mosquitto.h"
+#include "mosquitto_broker.h"
+
 
 // Support only mqtt v5
 int mosquitto_plugin_version(int supported_version_count, const int *supported_versions
@@ -21,15 +24,32 @@ int mosquitto_plugin_version(int supported_version_count, const int *supported_v
 int basic_auth_callback(int event, void *event_data, void *user_data)
 {
     CURL *curl;
-    CURLcode response;
+    CURLcode response = CURLE_FAILED_INIT;
 
     struct mosquitto_evt_basic_auth *data = (struct mosquitto_evt_basic_auth *) event_data;
     struct broker_settings *settings = (struct broker_settings *) user_data;
+
+
+    curl = curl_easy_init();
+
+    if(curl == NULL)
+    {
+        fprintf(stderr, "Failed to initialize CURL\n");
+        cleanup(curl, NULL, NULL, NULL);
+        return MOSQ_ERR_AUTH;
+    }
+
     
     // get size of protocol
     int url_len = strlen(settings->protocol) + 3 + strlen(settings->host) + 1 + strlen(settings->port) + strlen(settings->endpoint_auth) + 1;
 
     char * url = malloc(url_len);
+    if(url == NULL)
+    {
+        fprintf(stderr, "Failed to allocated memory for url\n");
+        cleanup(curl, NULL, NULL, url);
+        return MOSQ_ERR_AUTH;
+    }
 
     // construct url
     snprintf(url, url_len, "%s://%s:%s%s",
@@ -37,15 +57,19 @@ int basic_auth_callback(int event, void *event_data, void *user_data)
         settings->host,
         settings->port,
         settings->endpoint_auth);
-
     
     curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 12L);
 
 
     // construct json body for post request
-
     cJSON *json = cJSON_CreateObject();
+    if(json == NULL) {
+        fprintf(stderr, "Failed to create JSON documment\n");
+        cleanup(curl, json, NULL, url);
+        return MOSQ_ERR_AUTH;
+    }
+
+
     cJSON_AddStringToObject(json, "client_id", mosquitto_client_id(data->client));
     cJSON_AddStringToObject(json, "username", data->username);
     cJSON_AddStringToObject(json, "password", data->password);
@@ -55,9 +79,18 @@ int basic_auth_callback(int event, void *event_data, void *user_data)
     curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, payload);
 
     response = curl_easy_perform(curl);
+    if(response != CURLE_OK) {
+        fprintf(stderr, "Authentication failed with rest API, error code : %d\n", response);
+        cleanup(curl, json, payload, url);
+        return MOSQ_ERR_AUTH;
+    }
+
     curl_easy_cleanup(curl);
 
-    return 1;
+    fprintf(stdout, "Response request : %d\n", response);
+    
+
+    return MOSQ_ERR_SUCCESS;
 
 }
 
@@ -111,9 +144,26 @@ int mosquitto_plugin_cleanup(void *userdata, struct mosquitto_opt *options, int 
     return 0;
 }
 
-void free_broker_settings_struct(struct broker_settings* data)
-{
+void free_broker_settings_struct(struct broker_settings* data) {
     fprintf(stdout, "Release malloc ressources.");
     free(data->host);
     free(data);
+}
+
+void cleanup(CURL *curl, cJSON *json, char *payload, char *url) {
+    if(curl) {
+        curl_easy_cleanup(curl);
+    }
+
+    if(json) {
+        cJSON_Delete(json);
+    }
+
+    if(payload) {
+        free(payload);
+    }  
+
+    if(url) {
+        free(url);
+    }
 }

@@ -1,11 +1,16 @@
 .PHONY: clean
 
-lyra_plugin.so: lyra_plugin.o
-	gcc build/lyra_plugin.o -shared -o build/lyra_plugin.so
+CC = gcc
+CFLAGS = -Wall -fPIC
+LDFLAGS = -shared
+LIBS = -lcjson -lcurl
 
-lyra_plugin.o:
-	gcc -I include/ -c -fPIC src/lyra_plugin.c -o lyra_plugin.o
-	mv -v lyra_plugin.o build/
+TARGET = lyra_plugin.so
+SOURCES = src/lyra_plugin.c
+
+$(TARGET): $(SOURCES)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS) -I include/
+	mv $@ build/
 
 clean:
 	rm -vf build/
