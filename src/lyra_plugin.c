@@ -23,32 +23,23 @@ int mosquitto_plugin_version(int supported_version_count, const int *supported_v
 
 int basic_auth_callback(int event, void *event_data, void *user_data)
 {
-    CURL *curl;
-    CURLcode response = CURLE_FAILED_INIT;
-
     struct mosquitto_evt_basic_auth *data = (struct mosquitto_evt_basic_auth *) event_data;
     struct broker_settings *settings = (struct broker_settings *) user_data;
+    struct memory_payload response = {.curl_status = CURLE_FAILED_INIT, .size = 0, .memory = malloc(1)};
+    AUTH_RESULT result = UNAUTHORIZED;
 
-
-    curl = curl_easy_init();
-
-    if(curl == NULL)
-    {
-        fprintf(stderr, "Failed to initialize CURL\n");
-        cleanup(curl, NULL, NULL, NULL);
-        return MOSQ_ERR_AUTH;
+    if(response.memory == NULL) {
+        fprintf(stderr, "Failed to allocate dynamically memory for response payload.");
+        goto cleanup;
     }
 
-    
-    // get size of protocol
     int url_len = strlen(settings->protocol) + 3 + strlen(settings->host) + 1 + strlen(settings->port) + strlen(settings->endpoint_auth) + 1;
 
     char * url = malloc(url_len);
     if(url == NULL)
     {
         fprintf(stderr, "Failed to allocated memory for url\n");
-        cleanup(curl, NULL, NULL, url);
-        return MOSQ_ERR_AUTH;
+        goto cleanup;
     }
 
     // construct url
@@ -57,40 +48,34 @@ int basic_auth_callback(int event, void *event_data, void *user_data)
         settings->host,
         settings->port,
         settings->endpoint_auth);
-    
-    curl_easy_setopt(curl, CURLOPT_URL, url);
 
 
-    // construct json body for post request
-    cJSON *json = cJSON_CreateObject();
-    if(json == NULL) {
-        fprintf(stderr, "Failed to create JSON documment\n");
-        cleanup(curl, json, NULL, url);
-        return MOSQ_ERR_AUTH;
-    }
-
-
-    cJSON_AddStringToObject(json, "client_id", mosquitto_client_id(data->client));
-    cJSON_AddStringToObject(json, "username", data->username);
-    cJSON_AddStringToObject(json, "password", data->password);
-
-    char *payload = cJSON_Print(json);
-
-    curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, payload);
-
-    response = curl_easy_perform(curl);
-    if(response != CURLE_OK) {
-        fprintf(stderr, "Authentication failed with rest API, error code : %d\n", response);
-        cleanup(curl, json, payload, url);
-        return MOSQ_ERR_AUTH;
-    }
-
-    curl_easy_cleanup(curl);
-
-    fprintf(stdout, "Response request : %d\n", response);
+    struct payload_attributes attributes[3] = {{"client_id", mosquitto_client_id(data->client)}, {"username", data->username}, {"password", data->password}};
     
 
-    return MOSQ_ERR_SUCCESS;
+    call_api(url, attributes, 3, &response);
+
+    result = validate_auth_response(&response);
+
+    cleanup:
+
+        if(response.memory) {
+            free(response.memory);
+        }
+
+        if(url) {
+            free(url);
+        }
+
+        if(response.curl_status != CURLE_OK) {
+            return MOSQ_ERR_AUTH;
+        }
+
+    if(result == AUTHORIZED) {
+        return MOSQ_ERR_SUCCESS;
+    }
+
+    return MOSQ_ERR_AUTH;
 
 }
 
@@ -150,20 +135,143 @@ void free_broker_settings_struct(struct broker_settings* data) {
     free(data);
 }
 
-void cleanup(CURL *curl, cJSON *json, char *payload, char *url) {
-    if(curl) {
-        curl_easy_cleanup(curl);
+CURLcode call_api(char *url, struct payload_attributes *attributes, int attribut_count, struct memory_payload *payload) {
+    
+    CURL *curl = NULL;
+    CURLcode resp = CURLE_FAILED_INIT;
+    cJSON *json = NULL;
+    char *payload_attributes = NULL;
+    struct curl_slist *headers = NULL;
+
+    curl = curl_easy_init();
+    if(curl == NULL) {
+        fprintf(stderr, "Failed to init curl");
+        goto cleanup;
     }
 
-    if(json) {
-        cJSON_Delete(json);
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    if(headers == NULL) {
+        fprintf(stderr, "Failed to set headers");
+        goto cleanup;
     }
 
-    if(payload) {
-        free(payload);
-    }  
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
 
-    if(url) {
-        free(url);
+    json = cJSON_CreateObject();
+    if(json == NULL) {
+        fprintf(stderr, "Failed to create cJSON object");
+        goto cleanup;
     }
+
+    for(int i = 0 ; i < attribut_count; i++) {
+        if(cJSON_AddStringToObject(json, attributes[i].key, attributes[i].value) == NULL) {
+            fprintf(stderr, "Failed to add item to json object");
+            goto cleanup;
+        }
+    }
+
+    payload_attributes = cJSON_Print(json);
+    if(payload_attributes == NULL) {
+        fprintf(stderr, "Failed to allocate char * buffer for payload string");
+        goto cleanup;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, payload_attributes);
+
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_response_to_memory);
+
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)payload);
+
+    
+    resp = curl_easy_perform(curl);
+
+    payload->curl_status = resp;
+
+
+    cleanup:
+
+        if(curl) {
+            curl_easy_cleanup(curl);
+        }
+
+        if(headers) {
+            curl_slist_free_all(headers);
+        }
+
+        if(json) {
+            cJSON_Delete(json);
+        }
+
+        if(payload_attributes) {
+            free(payload_attributes);
+        }
+
+
+        return resp;
+
+}
+
+static size_t write_response_to_memory(void *contents, size_t size, size_t nmemb, void *userp) {
+
+size_t realsize = size * nmemb;
+    struct memory_payload *mem = (struct memory_payload *)userp;
+    
+    char *ptr = realloc(mem->memory, mem->size + realsize + 1);
+    if(!ptr) {
+        /* out of memory! */
+        printf("not enough memory (realloc returned NULL)\n");
+        return 0;
+    }
+    
+    mem->memory = ptr;
+    memcpy(&(mem->memory[mem->size]), contents, realsize);
+    mem->size += realsize;
+    mem->memory[mem->size] = 0;
+    
+    return realsize;
+
+}
+
+AUTH_RESULT validate_auth_response(struct memory_payload *payload) {
+
+    cJSON *json = cJSON_Parse(payload->memory);
+    cJSON *ok = NULL;
+    cJSON *err = NULL;
+    AUTH_RESULT result = UNAUTHORIZED;
+
+    if(json == NULL) {
+        fprintf(stderr, "Failed to allocate pointer for json deserialized");
+        goto cleanup;
+    }
+
+
+    ok = cJSON_GetObjectItem(json, "Ok");
+    if(!cJSON_IsBool(ok)) {
+        goto cleanup;
+    }
+
+    fprintf(stderr, "curl code : %d, ok value : %d", payload->curl_status, ok->valueint);
+
+    if(ok->valueint == 1 && payload->curl_status == CURLE_OK) {
+        result = AUTHORIZED;
+        goto cleanup;
+    }
+
+
+    err = cJSON_GetObjectItem(json, "Error");
+    if(!cJSON_IsString(err)) {
+        goto cleanup;
+    }
+
+    fprintf(stderr, "Authentication failed : %s", err->valuestring);
+
+    cleanup:
+
+        if(json) {
+            cJSON_Delete(json);
+        }
+
+        return result;
+
 }

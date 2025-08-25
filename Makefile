@@ -1,3 +1,5 @@
+include config.mk
+
 .PHONY: clean
 
 CC = gcc
@@ -13,4 +15,4 @@ $(TARGET): $(SOURCES)
 	mv $@ build/
 
 clean:
-	rm -vf build/
+	rm -vf build/*
